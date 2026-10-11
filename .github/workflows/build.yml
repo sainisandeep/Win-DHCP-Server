@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Logic checks
+        run: dotnet run --project DhcpServer.SelfTest
+
+      - name: Build DHCPServer.exe
+        run: dotnet publish DhcpServer.App -c Release -o out
+
+      # Catches anything that only fails when the window is actually created.
+      - name: The app opens and stays open
+        shell: pwsh
+        run: |
+          $app = Start-Process out/DHCPServer.exe -PassThru
+          Start-Sleep -Seconds 20
+          if ($app.HasExited) {
+            $crash = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = '.NET Runtime' } -MaxEvents 1 -ErrorAction SilentlyContinue
+            $detail = if ($crash) { $crash.Message -replace '\s+', ' ' } else { 'no crash record found' }
+            Write-Host "::error::DHCPServer.exe exited with code $($app.ExitCode): $($detail.Substring(0, [Math]::Min(1500, $detail.Length)))"
+            exit 1
+          }
+          $app.Refresh()
+          if ($app.MainWindowHandle -eq 0) { Write-Host "::warning::DHCPServer.exe is running but no window was detected" }
+          Stop-Process -Id $app.Id
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DHCPServer-windows
+          path: out/DHCPServer.exe
+
+      # Raising <Version> in DhcpServer.App.csproj and pushing to main publishes a new release.
+      - name: Publish a release for a new version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "$(([xml](Get-Content DhcpServer.App/DhcpServer.App.csproj)).Project.PropertyGroup.Version)".Trim()
+          $tag = "v$version"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Host "$tag is already released"; exit 0 }
+          gh release create $tag out/DHCPServer.exe --title "DHCP Server $version" --notes-file RELEASE_NOTES.md --target $env:GITHUB_SHA
